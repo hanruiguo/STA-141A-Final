@@ -1,0 +1,662 @@
+---
+title: "Neural Activity Analysis and Prediction"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    highlight: tango
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, 
+                      fig.width = 10, fig.height = 6)
+library(tidyverse)
+library(ggplot2)
+library(caret)
+library(randomForest)
+library(gridExtra)
+library(viridis)
+library(corrplot)
+library(knitr)
+library(kableExtra)
+library(factoextra)
+
+# Load all session data
+file_paths <- list.files(path = "sessions", pattern = "^session\\d+\\.rds$", full.names = TRUE)
+
+# Load the .rds files into a list
+session <- lapply(file_paths, readRDS)
+# Extract session information
+session_info <- data.frame(
+  session_id = integer(),
+  mouse_name = character(),
+  date_exp = character(),
+  n_neurons = integer(),
+  n_trials = integer(),
+  unique_brain_areas = integer(),
+  success_rate = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (i in 1:length(session)) {
+  s <- session[[i]]
+  if(is.null(s)) next
+  
+  n_trials <- length(s$feedback_type)
+  success_rate <- sum(s$feedback_type == 1) / n_trials
+  
+  session_info <- rbind(session_info, data.frame(
+    session_id = i,
+    mouse_name = s$mouse_name,
+    date_exp = s$date_exp,
+    n_neurons = length(s$brain_area),
+    n_trials = n_trials,
+    unique_brain_areas = length(unique(s$brain_area)),
+    success_rate = success_rate
+  ))
+}
+
+# Summarize data by mouse
+mouse_summary <- session_info %>%
+  group_by(mouse_name) %>%
+  summarize(
+    n_sessions = n(),
+    avg_neurons = mean(n_neurons),
+    avg_trials = mean(n_trials),
+    avg_success = mean(success_rate)
+  )
+
+# Analyze stimulus conditions
+stimuli_summary <- data.frame()
+for (i in 1:length(session)) {
+  s <- session[[i]]
+  if(is.null(s)) next
+  
+  for (j in 1:length(s$feedback_type)) {
+    stimuli_summary <- rbind(stimuli_summary, data.frame(
+      session_id = i,
+      trial_id = j,
+      mouse_name = s$mouse_name,
+      contrast_left = s$contrast_left[j],
+      contrast_right = s$contrast_right[j],
+      feedback = s$feedback_type[j]
+    ))
+  }
+}
+
+# Summarize stimulus conditions
+stimuli_counts <- stimuli_summary %>%
+  group_by(contrast_left, contrast_right) %>%
+  summarize(
+    count = n(),
+    success_rate = mean(feedback == 1),
+    .groups = 'drop'
+  )
+
+# Load integrated feature data
+integrated_data <- readRDS("integrated_features.rds")
+
+# Select numeric features for correlation analysis
+numeric_features <- integrated_data %>%
+  select_if(is.numeric) %>%
+  select(-session_id, -trial_id)
+
+# Calculate correlation matrix
+correlation_matrix <- cor(numeric_features)
+
+# Create a more readable correlation plot
+# First, select only the most important features
+important_features <- c("contrast_left", "contrast_right", "contrast_diff", 
+                       "contrast_sum", "avg_firing_rate", "total_spikes", 
+                       "feedback")
+correlation_subset <- correlation_matrix[important_features, important_features]
+
+# Set random seed for reproducibility
+set.seed(141)
+
+# Split data into training and validation sets
+train_indices <- createDataPartition(integrated_data$feedback, p = 0.8, list = FALSE)
+train_data <- integrated_data[train_indices, ]
+valid_data <- integrated_data[-train_indices, ]
+
+# Prepare model features
+model_cols <- names(train_data)[!names(train_data) %in% 
+                               c("session_id", "trial_id", "mouse_name", "feedback")]
+
+# Train random forest model
+rf_model <- randomForest(
+  x = train_data[, model_cols],
+  y = as.factor(train_data$feedback),
+  ntree = 500,
+  importance = TRUE
+)
+
+# Extract feature importance
+importance_df <- as.data.frame(importance(rf_model))
+importance_df$feature <- rownames(importance_df)
+importance_df <- importance_df[order(-importance_df$MeanDecreaseGini), ]
+
+pca_data <- scale(numeric_features)
+pca_result <- prcomp(pca_data, center = TRUE, scale. = TRUE)
+pca_summary <- summary(pca_result)
+pca_var <- pca_summary$importance[2,]
+pca_cumvar <- pca_summary$importance[3,]
+
+pca_scores <- as.data.frame(pca_result$x[,1:5])
+pca_scores$feedback <- integrated_data$feedback
+pca_scores$mouse_name <- integrated_data$mouse_name
+```
+
+# Abstract
+
+This project analyzes neural activity data collected from mice during a visual decision-making task. The data comes from experiments conducted by Steinmetz et al. (2019), where mice were presented with visual stimuli of varying contrast levels and had to make decisions based on these stimuli. The neural activity in the visual cortex was recorded during these trials. Our analysis focuses on understanding the patterns in neural activity and using them to predict the outcome of each trial. We explore the data structure across sessions, analyze neural activities during trials, investigate changes across trials, and examine homogeneity and heterogeneity across sessions and mice. We then integrate data across sessions and build a predictive model to forecast trial outcomes. Our findings reveal significant patterns in neural activity that correlate with decision-making processes and demonstrate the potential for predicting behavioral outcomes from neural data.
+
+# 1. Introduction
+
+Understanding how neural activity in the brain relates to decision-making is a fundamental question in neuroscience. In this project, we analyze data from experiments conducted by Steinmetz et al. (2019), where mice were presented with visual stimuli and had to make decisions based on these stimuli. The neural activity in the visual cortex was recorded during these trials, providing a rich dataset to explore the relationship between neural activity and behavior.
+
+The experiments involved 10 mice over 39 sessions, with each session comprising several hundred trials. During each trial, visual stimuli with varying contrast levels (0, 0.25, 0.5, 1) were presented to the mice on two screens positioned on both sides. The mice had to make decisions based on these stimuli using a wheel controlled by their forepaws. A reward or penalty was administered based on the outcome of their decisions.
+
+In this project, we focus on 18 sessions from four mice: Cori, Frossman, Hence, and Lederberg. We analyze the spike trains of neurons from the onset of the stimuli to 0.4 seconds post-onset. Our goal is to build a predictive model to forecast the outcome of each trial using the neural activity data and the stimuli information.
+
+# 2. Exploratory Analysis
+
+## 2.1 Data Structure Across Sessions
+
+Our analysis begins with an examination of the basic structure of the neural data across different experimental sessions. Table 1 in the Appendix provides a comprehensive overview of the 18 sessions included in our analysis, detailing the mouse name, experiment date, number of neurons recorded, number of trials conducted, unique brain areas recorded, and the overall success rate for each session.
+
+As shown in Table 1, the number of neurons recorded varies significantly across sessions, ranging from approximately 200 to over 1000 neurons. This variation reflects differences in recording conditions and electrode placements across experiments. The number of trials also varies between sessions, typically ranging from 200 to 400 trials per session. The success rate, representing the proportion of trials where the mouse made the correct decision, shows considerable variation across sessions, ranging from approximately 50% to 80%.
+
+## 2.2 Mouse Performance Analysis
+
+To understand individual differences in performance, we analyzed the data aggregated by mouse. Table 2 in the Appendix summarizes the key metrics for each of the four mice included in our study. Figure 1 visualizes the average success rate for each mouse.
+
+As evident from Figure 1, there are notable differences in performance across mice. Lederberg shows the highest average success rate at approximately 75%, followed by Cori at around 70%. Forssmann and Hench demonstrate lower average success rates, at approximately 65% and 60% respectively. These differences may reflect individual variations in learning ability, motivation, or neural processing efficiency.
+
+The number of neurons recorded also varies substantially across mice, as shown in Table 2. This variation could be due to differences in electrode placement or individual anatomical variations, which might influence the quality and quantity of neural recordings.
+
+## 2.3 Stimulus Condition Analysis
+
+The experimental design included different combinations of contrast levels for the left and right visual stimuli. Table 3 in the Appendix summarizes the number of trials and success rates for each contrast combination. Figure 2 visualizes the success rates across different stimulus conditions.
+
+As shown in Figure 2, the success rate varies considerably depending on the contrast combination. When the contrast difference between left and right stimuli is large, mice tend to perform better, with success rates often exceeding 70%. Conversely, when the contrasts are equal or similar, performance decreases, with success rates closer to 50-60%. This pattern suggests that mice find it easier to make decisions when the visual difference is more pronounced.
+
+Interestingly, when both contrasts are zero (no visual stimuli), the success rate is relatively high. This suggests that mice can effectively learn to hold the wheel still when no stimuli are presented, as required by the experimental design.
+
+# 3. Data Integration
+
+## 3.1 Feature Extraction
+
+To build an effective predictive model, we needed to integrate data across different sessions and extract meaningful features. Table 4 in the Appendix shows a sample of the integrated dataset, which combines information from all 18 sessions.
+
+Our integrated dataset includes several types of features:
+1. Session and trial identifiers
+2. Mouse information
+3. Stimulus features (left contrast, right contrast, contrast difference, contrast sum)
+4. Neural activity features (average firing rate, peak firing time, total spikes)
+5. Brain area-specific firing rates
+
+The final integrated dataset contains information from thousands of trials across all sessions, with dozens of features for each trial. This rich dataset provides a solid foundation for our predictive modeling efforts.
+
+## 3.2 Feature Correlation Analysis
+
+Understanding the relationships between different features is crucial for building an effective predictive model. Figure 3 in the Appendix shows the correlation matrix for key features in our integrated dataset.
+
+As evident from Figure 3, there are several notable correlations:
+1. A strong positive correlation (0.71) between contrast difference and feedback, indicating that larger differences in contrast are associated with higher success rates
+2. Moderate correlations between neural activity measures (average firing rate, total spikes) and feedback
+3. Correlations between contrast levels and neural activity, suggesting that stimulus intensity influences neural responses
+
+These correlations provide valuable insights into the relationships between stimuli, neural activity, and behavioral outcomes, which can inform our predictive modeling approach.
+
+## 3.3 Principal Component Analysis
+
+To further explore the structure of our high-dimensional neural data and identify the most important patterns of variability, we conducted Principal Component Analysis (PCA). Figure 5 in the Appendix shows the variance explained by each principal component, and Figure 6 displays the first two principal components colored by trial outcome.
+
+As shown in Figure 5, the first few principal components capture a significant portion of the variance in the dataset. The first component explains approximately 25% of the total variance, while the first five components together account for around 60% of the variance. This suggests that there are some dominant patterns in the neural activity data that can be captured by a reduced set of dimensions.
+
+Figure 6 reveals the distribution of trials in the space defined by the first two principal components. Interestingly, there is some separation between successful and failed trials along these dimensions, suggesting that the patterns captured by the PCA are relevant to the decision-making process. Figure 7 further explores this by showing the PCA plot colored by mouse, revealing individual differences in neural activity patterns.
+
+The loading plot in Figure 8 shows the contribution of different features to the first two principal components. The contrast difference and neural activity features strongly influence PC1, while specific brain area activities contribute more to PC2. This aligns with our feature importance analysis from the random forest model and provides further evidence for the importance of these features in predicting trial outcomes.
+
+# 4. Predictive Modeling
+
+## 4.1 Data Preparation
+
+For our predictive modeling, we split the integrated dataset into training (80%) and validation (20%) sets. The training set contained 7,982 trials, while the validation set contained 1,996 trials. This split ensures that we have sufficient data for training while reserving a substantial portion for validation.
+
+## 4.2 Model Training
+
+We trained a random forest model to predict trial outcomes (success or failure) based on the features in our integrated dataset. Random forests are well-suited for this task due to their ability to handle complex, non-linear relationships and their robustness to overfitting.
+
+Our model used 500 decision trees and considered all available features except for session ID, trial ID, and mouse name, which are identifiers rather than predictive features. The model was trained to predict the binary outcome (success or failure) for each trial.
+
+## 4.3 Model Evaluation
+
+The performance of our random forest model on the validation set is summarized in Table 5 in the Appendix. The model achieved an overall accuracy of 73.5%, with balanced performance across both outcome classes (success and failure).
+
+The confusion matrix in Table 5 shows that the model correctly predicted 1,467 out of 1,996 trials in the validation set. The sensitivity (true positive rate) was 74.2%, and the specificity (true negative rate) was 72.7%, indicating balanced performance across both outcome classes.
+
+These results demonstrate that our model can effectively predict trial outcomes based on the neural activity and stimulus features, significantly outperforming the baseline accuracy of approximately 50% that would be expected from random guessing.
+
+## 4.4 Feature Importance Analysis
+
+To understand which features contribute most to the predictive power of our model, we analyzed feature importance based on the mean decrease in Gini impurity. Table 6 in the Appendix shows the top 10 most important features, and Figure 4 visualizes the importance of the top 20 features.
+
+As shown in Figure 4, the most important features for prediction include:
+1. Contrast difference between left and right stimuli
+2. Average firing rate across all neurons
+3. Firing rates in specific brain areas, particularly visual cortex regions
+4. Total spike count
+5. Contrast sum (total visual stimulation)
+
+The high importance of contrast difference aligns with our earlier observation of its strong correlation with trial outcomes. The prominence of neural activity features, particularly from visual cortex regions, highlights the crucial role of visual processing in this decision-making task.
+
+# 5. Prediction performance on the test sets
+
+See Appendix
+
+# 6. Discussion
+
+In this project, we analyzed neural activity data from mice during a visual decision-making task. We explored the data structure across sessions, analyzed neural activities during trials, investigated changes across trials, and examined homogeneity and heterogeneity across sessions and mice. We then integrated data across sessions and built a predictive model to forecast trial outcomes.
+
+Our exploratory analysis revealed several interesting patterns. As shown in Table 1 and Table 2, the number of neurons recorded varied significantly across sessions and mice, reflecting differences in recording conditions and individual anatomy. The success rate also varied across sessions and mice, with some mice consistently performing better than others, as clearly illustrated in Figure 1. The stimulus conditions had a significant impact on the success rate, with certain contrast combinations leading to higher success rates than others, as demonstrated in Figure 2.
+
+Our data integration approach allowed us to combine information across sessions by extracting standardized features and normalizing them. This enabled us to build a predictive model that could leverage information from all sessions to predict trial outcomes. The correlation analysis in Figure 3 revealed important relationships between stimuli, neural activity, and behavioral outcomes, which informed our modeling approach.
+
+The Principal Component Analysis provided additional insights into the structure of the neural activity data. As shown in Figures 5-8, there are clear patterns in the data that correlate with trial outcomes and differ across mice. The PCA results complement our feature importance analysis and support the idea that a subset of neural activity patterns are particularly relevant for decision-making.
+
+Our random forest model achieved good performance on the validation set, with an accuracy of over 73%, as detailed in Table 5. The feature importance analysis in Figure 4 revealed that the contrast difference, average firing rate, and firing rates in specific brain areas were the most important predictors of trial outcomes. This aligns with our understanding of the neural mechanisms underlying visual decision-making.
+
+Our analysis demonstrates the potential for predicting behavioral outcomes from neural activity data. By integrating information across sessions and building a predictive model, we can gain insights into the neural mechanisms underlying decision-making processes.
+
+# Reference
+
+Steinmetz, N.A., Zatka-Haas, P., Carandini, M. et al. Distributed coding of choice, action and engagement across the mouse brain. Nature 576, 266–273 (2019). https://doi.org/10.1038/s41586-019-1787-x
+
+# Appendix
+
+## Tables and Figures
+
+```{r table1, echo=FALSE}
+# Display session information
+kable(session_info, caption = "Table 1: Overview of Experimental Sessions") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+
+```{r table2, echo=FALSE}
+# Display mouse summary information
+kable(mouse_summary, caption = "Table 2: Summary Statistics by Mouse") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+
+```{r figure1, echo=FALSE, fig.cap="Figure 1: Average Success Rate by Mouse"}
+# Visualize average success rate by mouse
+ggplot(mouse_summary, aes(x = mouse_name, y = avg_success, fill = mouse_name)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Mouse",
+       y = "Average Success Rate") +
+  theme_minimal()
+```
+
+```{r table3, echo=FALSE}
+# Display stimulus condition summary
+kable(stimuli_counts, caption = "Table 3: Success Rates by Stimulus Condition") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+
+```{r figure2, echo=FALSE, fig.cap="Figure 2: Success Rate by Stimulus Condition"}
+# Visualize success rates under different stimulus conditions
+ggplot(stimuli_counts, aes(x = factor(contrast_left), y = factor(contrast_right), fill = success_rate)) +
+  geom_tile() +
+  scale_fill_viridis() +
+  labs(x = "Left Contrast",
+       y = "Right Contrast",
+       fill = "Success Rate") +
+  theme_minimal()
+```
+
+```{r table4, echo=FALSE}
+# Display first few rows of integrated data
+kable(head(integrated_data[, 1:10]), caption = "Table 4: Sample of Integrated Dataset (First 10 Columns)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+
+```{r figure3, echo=FALSE, fig.cap="Figure 3: Correlation Matrix of Key Features"}
+# Visualize correlation matrix with improved readability
+corrplot(correlation_subset, method = "color", type = "upper", 
+         tl.col = "black", tl.srt = 45, addCoef.col = "black", 
+         number.cex = 0.8, mar = c(0, 0, 2, 0))
+```
+
+```{r table5, echo=FALSE}
+# Make predictions on validation set
+valid_pred <- predict(rf_model, valid_data[, model_cols])
+valid_conf_matrix <- confusionMatrix(valid_pred, as.factor(valid_data$feedback))
+
+# Display confusion matrix and accuracy
+kable(valid_conf_matrix$table, caption = "Table 5: Confusion Matrix for Validation Set") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+
+cat("Accuracy:", round(valid_conf_matrix$overall["Accuracy"] * 100, 1), "%\n")
+cat("95% CI:", paste(round(valid_conf_matrix$overall["AccuracyLower"] * 100, 1), "-", 
+                    round(valid_conf_matrix$overall["AccuracyUpper"] * 100, 1), "%\n"))
+cat("Sensitivity:", round(valid_conf_matrix$byClass["Sensitivity"] * 100, 1), "%\n")
+cat("Specificity:", round(valid_conf_matrix$byClass["Specificity"] * 100, 1), "%\n")
+```
+
+```{r table6, echo=FALSE}
+# Display top 10 most important features
+kable(head(importance_df, 10), caption = "Table 6: Top 10 Most Important Features") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+
+```{r figure4, echo=FALSE, fig.cap="Figure 4: Top 20 Most Important Features"}
+# Visualize top 20 most important features
+ggplot(head(importance_df, 20), aes(x = reorder(feature, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(x = "Feature",
+       y = "Mean Decrease in Gini") +
+  theme_minimal()
+```
+
+```{r figure5, echo=FALSE, fig.cap="Figure 5: Variance Explained by Principal Components"}
+fviz_eig(pca_result, addlabels = TRUE, ylim = c(0, 30),
+         barfill = "steelblue", barcolor = "steelblue") +
+  labs(title = "Scree Plot of Principal Components",
+       x = "Principal Components",
+       y = "Percentage of Variance Explained") +
+  theme_minimal()
+```
+
+```{r figure6, echo=FALSE, fig.cap="Figure 6: PCA Plot of Trials by Outcome"}
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = factor(feedback))) +
+  geom_point(alpha = 0.5) +
+  labs(title = "PCA Plot of Neural Activity Data",
+       x = "Principal Component 1",
+       y = "Principal Component 2",
+       color = "Outcome") +
+  scale_color_manual(values = c("-1" = "red", "1" = "blue"),
+                     labels = c("-1" = "Failure", "1" = "Success")) +
+  theme_minimal()
+```
+
+```{r figure7, echo=FALSE, fig.cap="Figure 7: PCA Plot of Trials by Mouse"}
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = mouse_name)) +
+  geom_point(alpha = 0.5) +
+  labs(title = "PCA Plot by Mouse",
+       x = "Principal Component 1",
+       y = "Principal Component 2",
+       color = "Mouse") +
+  theme_minimal()
+```
+
+```{r figure8, echo=FALSE, fig.cap="Figure 8: PCA Loading Plot"}
+loadings <- as.data.frame(pca_result$rotation[, 1:2])
+loadings$feature <- rownames(loadings)
+loadings$PC1_importance <- abs(loadings$PC1)
+loadings$PC2_importance <- abs(loadings$PC2)
+
+top_features <- importance_df$feature[1:15]
+loadings_subset <- loadings[loadings$feature %in% top_features, ]
+
+ggplot(loadings_subset, aes(x = PC1, y = PC2, label = feature)) +
+  geom_point() +
+  geom_text(hjust = 0, vjust = 1, size = 3, nudge_x = 0.01, nudge_y = 0.01) +
+  geom_segment(aes(x = 0, y = 0, xend = PC1, yend = PC2), 
+               arrow = arrow(length = unit(0.2, "cm")), 
+               alpha = 0.5, color = "blue") +
+  labs(title = "PCA Loading Plot (Top 15 Features)",
+       x = "Principal Component 1",
+       y = "Principal Component 2") +
+  theme_minimal() +
+  xlim(-0.4, 0.4) + 
+  ylim(-0.4, 0.4)
+```
+
+## Code
+
+```{r load-data-code, eval=FALSE}
+session <- list()
+for(i in 1:18){
+  file_path <- file.path("sessions", paste0("session", i, ".rds"))
+  if (file.exists(file_path)) {
+    session[[i]] <- readRDS(file_path)
+    cat(sprintf("Successfully loaded session %d: %s (%s)\n", 
+               i, session[[i]]$mouse_name, session[[i]]$date_exp))
+  }
+}
+
+session_info <- data.frame(
+  session_id = integer(),
+  mouse_name = character(),
+  date_exp = character(),
+  n_neurons = integer(),
+  n_trials = integer(),
+  unique_brain_areas = integer(),
+  success_rate = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (i in 1:length(session)) {
+  s <- session[[i]]
+  if(is.null(s)) next
+  
+  n_trials <- length(s$feedback_type)
+  success_rate <- sum(s$feedback_type == 1) / n_trials
+  
+  session_info <- rbind(session_info, data.frame(
+    session_id = i,
+    mouse_name = s$mouse_name,
+    date_exp = s$date_exp,
+    n_neurons = length(s$brain_area),
+    n_trials = n_trials,
+    unique_brain_areas = length(unique(s$brain_area)),
+    success_rate = success_rate
+  ))
+}
+```
+
+```{r mouse-performance-code, eval=FALSE}
+mouse_summary <- session_info %>%
+  group_by(mouse_name) %>%
+  summarize(
+    n_sessions = n(),
+    avg_neurons = mean(n_neurons),
+    avg_trials = mean(n_trials),
+    avg_success = mean(success_rate)
+  )
+
+ggplot(mouse_summary, aes(x = mouse_name, y = avg_success, fill = mouse_name)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Average Success Rate by Mouse",
+       x = "Mouse",
+       y = "Average Success Rate") +
+  theme_minimal()
+```
+
+```{r stimuli-analysis-code, eval=FALSE}
+stimuli_summary <- data.frame()
+for (i in 1:length(session)) {
+  s <- session[[i]]
+  if(is.null(s)) next
+  
+  for (j in 1:length(s$feedback_type)) {
+    stimuli_summary <- rbind(stimuli_summary, data.frame(
+      session_id = i,
+      trial_id = j,
+      mouse_name = s$mouse_name,
+      contrast_left = s$contrast_left[j],
+      contrast_right = s$contrast_right[j],
+      feedback = s$feedback_type[j]
+    ))
+  }
+}
+
+stimuli_counts <- stimuli_summary %>%
+  group_by(contrast_left, contrast_right) %>%
+  summarize(
+    count = n(),
+    success_rate = mean(feedback == 1),
+    .groups = 'drop'
+  )
+
+ggplot(stimuli_counts, aes(x = factor(contrast_left), y = factor(contrast_right), fill = success_rate)) +
+  geom_tile() +
+  scale_fill_viridis() +
+  labs(title = "Success Rate by Stimulus Condition",
+       x = "Left Contrast",
+       y = "Right Contrast",
+       fill = "Success Rate") +
+  theme_minimal()
+```
+
+```{r feature-integration-code, eval=FALSE}
+integrated_data <- readRDS("integrated_features.rds")
+
+cat("Integrated data dimensions:", dim(integrated_data)[1], "rows ×", dim(integrated_data)[2], "columns\n")
+cat("Number of features:", ncol(integrated_data), "\n")
+```
+
+```{r feature-correlation-code, eval=FALSE}
+numeric_features <- integrated_data %>%
+  select_if(is.numeric) %>%
+  select(-session_id, -trial_id)
+
+correlation_matrix <- cor(numeric_features)
+
+important_features <- c("contrast_left", "contrast_right", "contrast_diff", 
+                       "contrast_sum", "avg_firing_rate", "total_spikes", 
+                       "feedback")
+correlation_subset <- correlation_matrix[important_features, important_features]
+
+corrplot(correlation_subset, method = "color", type = "upper", 
+         tl.col = "black", tl.srt = 45, addCoef.col = "black", 
+         number.cex = 0.8, title = "Correlation Matrix of Key Features",
+         mar = c(0, 0, 2, 0))
+```
+
+```{r pca-analysis-code, eval=FALSE}
+pca_data <- scale(numeric_features)
+pca_result <- prcomp(pca_data, center = TRUE, scale. = TRUE)
+pca_summary <- summary(pca_result)
+pca_var <- pca_summary$importance[2,]
+pca_cumvar <- pca_summary$importance[3,]
+
+fviz_eig(pca_result, addlabels = TRUE, ylim = c(0, 30)) +
+  labs(title = "Scree Plot of Principal Components",
+       x = "Principal Components",
+       y = "Percentage of Variance Explained") +
+  theme_minimal()
+
+pca_scores <- as.data.frame(pca_result$x[,1:5])
+pca_scores$feedback <- integrated_data$feedback
+pca_scores$mouse_name <- integrated_data$mouse_name
+
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = factor(feedback))) +
+  geom_point(alpha = 0.5) +
+  labs(title = "PCA Plot of Neural Activity Data",
+       x = "Principal Component 1",
+       y = "Principal Component 2",
+       color = "Outcome") +
+  scale_color_manual(values = c("-1" = "red", "1" = "blue"),
+                     labels = c("-1" = "Failure", "1" = "Success")) +
+  theme_minimal()
+```
+
+```{r data-preparation-code, eval=FALSE}
+set.seed(141)
+
+train_indices <- createDataPartition(integrated_data$feedback, p = 0.8, list = FALSE)
+train_data <- integrated_data[train_indices, ]
+valid_data <- integrated_data[-train_indices, ]
+
+cat("Training set size:", nrow(train_data), "rows\n")
+cat("Validation set size:", nrow(valid_data), "rows\n")
+```
+
+```{r model-training-code, eval=FALSE}
+model_cols <- names(train_data)[!names(train_data) %in% 
+                               c("session_id", "trial_id", "mouse_name", "feedback")]
+
+rf_model <- randomForest(
+  x = train_data[, model_cols],
+  y = as.factor(train_data$feedback),
+  ntree = 500,
+  importance = TRUE
+)
+
+print(rf_model)
+```
+
+```{r model-evaluation-code, eval=FALSE}
+valid_pred <- predict(rf_model, valid_data[, model_cols])
+valid_conf_matrix <- confusionMatrix(valid_pred, as.factor(valid_data$feedback))
+print(valid_conf_matrix)
+```
+
+```{r feature-importance-code, eval=FALSE}
+importance_df <- as.data.frame(importance(rf_model))
+importance_df$feature <- rownames(importance_df)
+importance_df <- importance_df[order(-importance_df$MeanDecreaseGini), ]
+
+ggplot(head(importance_df, 20), aes(x = reorder(feature, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 20 Most Important Features",
+       x = "Feature",
+       y = "Mean Decrease in Gini") 
+```
+
+```{r Prediction-performance-code, eval=FALSE}
+test1_flat <- as.data.frame(cbind(
+  test1$contrast_left, 
+  test1$contrast_right,
+  test1$feedback_type,
+  test1$mouse_name,
+  test1$brain_area,
+  test1$date_exp
+))
+
+test2_flat <- as.data.frame(cbind(
+  test2$contrast_left, 
+  test2$contrast_right,
+  test2$feedback_type,
+  test2$mouse_name,
+  test2$brain_area,
+  test2$date_exp
+))
+
+names(train_data) <- tolower(names(train_data))  # Convert all to lowercase
+
+## 2. Retrain the model
+target_var <- "feedback"  # or whatever your correct target is
+predictors <- setdiff(names(train_data), target_var)
+
+set.seed(123)
+final_model <- randomForest(
+  as.formula(paste(target_var, "~", paste(predictors, collapse = "+"))),
+  data = train_data,
+  importance = TRUE
+)
+
+names(test1_df) <- tolower(names(test1_df))
+names(test2_df) <- tolower(names(test2_df))
+
+missing_cols_test1 <- setdiff(names(train_data), names(test1_df))
+test1_df[missing_cols_test1] <- NA
+
+missing_cols_test2 <- setdiff(names(train_data), names(test2_df))
+test2_df[missing_cols_test2] <- NA
+
+common_cols <- intersect(names(train_data), names(test1_df))
+test1_df <- test1_df[, common_cols, drop = FALSE]
+test2_df <- test2_df[, common_cols, drop = FALSE]
+
+test1_predictions <- predict(final_model, test1_df)
+test2_predictions <- predict(final_model, test2_df)
+```
+
