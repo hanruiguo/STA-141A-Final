@@ -1,11 +1,13 @@
 ---
 title: "Neural Activity Analysis and Prediction"
+Name: "Hanrui Guo"
 output:
   html_document:
     toc: true
     toc_float: true
     theme: cosmo
     highlight: tango
+  
 ---
 
 ```{r setup, include=FALSE}
@@ -629,9 +631,8 @@ test2_flat <- as.data.frame(cbind(
   test2$date_exp
 ))
 
-names(train_data) <- tolower(names(train_data))  # Convert all to lowercase
+names(train_data) <- tolower(names(train_data)) 
 
-## 2. Retrain the model
 target_var <- "feedback"  # or whatever your correct target is
 predictors <- setdiff(names(train_data), target_var)
 
